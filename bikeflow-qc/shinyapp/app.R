@@ -1,4 +1,5 @@
 # BikeFlow QC — Cornell Six Sigma Hackathon, Team Plasma
+# Phase 2 — outage-duration prioritization and neighborhood statistics
 # Synthetic demonstration; no live bikeshare data are used.
 # Requires: install.packages("shiny")
 
@@ -84,13 +85,27 @@ network$usable <- !network$unusable
 network$hour <- as.integer(format(network$timestamp, "%H", tz = TIMEZONE))
 network$day <- as.character(as.Date(network$timestamp, tz = TIMEZONE))
 
+# Count consecutive unusable observations for each station.
+# Duration is a 15-minute sample-based estimate, not continuous telemetry.
+network$unusable_run_hours <- numeric(nrow(network))
+for (station in stations$station_id) {
+  indices <- which(network$station_id == station)
+  consecutive <- 0L
+  for (j in indices) {
+    consecutive <- if (network$unusable[j]) consecutive + 1L else 0L
+    network$unusable_run_hours[j] <- consecutive * INTERVAL_HOURS
+  }
+}
+
 # Invariants of the synthetic data generator.
 stopifnot(
   nrow(network) == N_STATIONS * N_INTERVALS,
   all(network$bikes >= 0L),
   all(network$docks >= 0L),
   all(network$bikes + network$docks == network$capacity),
-  all(!is.na(network$bikes))
+  all(!is.na(network$bikes)),
+  all(network$unusable_run_hours[!network$unusable] == 0),
+  all(network$unusable_run_hours[network$unusable] >= INTERVAL_HOURS)
 )
 
 # Exploratory p-chart using the first snapshot from each hour (n = 20).
@@ -142,14 +157,18 @@ ui <- fluidPage(
                       plotOutput("rush", height = "280px")))
       ),
       div(class = "panel", h4("Dispatch priority — most recent snapshot on selected day"),
-          p(class = "note", "Rule-based recommendations, not optimized van routes. Positive move means deliver bikes; negative means remove bikes."),
+          p(class = "note", "Critical stations are ranked by current continuous unusable duration, then by bikes needed to reach half capacity. Positive bike movement means deliver; negative means remove. Durations are estimates from 15-minute snapshots, not live outage timers."),
           tableOutput("dispatch")),
+      div(class = "panel", h4("Neighborhood service availability — selected day"),
+          p(class = "note", "Availability is the proportion of 15-minute station snapshots at which a station can both rent and accept a bike. This is an operational performance metric, not Cp or Cpk."),
+          tableOutput("area_availability")),
       div(class = "panel", h4("Exploratory p-chart: network unusability (all 7 days)"),
           plotOutput("pchart", height = "280px"),
           p(class = "note", "Each point is the fraction unusable among 20 stations at one hourly snapshot. Limits use p-bar +/- 3 sqrt[p-bar(1-p-bar)/20], clipped to [0,1]. Stations share demand patterns and observations are serially dependent, so these limits are descriptive screening thresholds, NOT proof of statistical control or special causes.")),
       div(class = "panel", h4("Methods and definitions"),
           p("Availability = usable station-observations / total station-observations."),
           p("Unusable station-hours = number of unusable 15-minute station-observations multiplied by 0.25 hours."),
+          p("Current outage duration = consecutive unusable snapshots up through the most recent reading, multiplied by 0.25 hours; a sampled estimate."),
           p("Warnings occur when a station has at most the selected number of bikes or open docks, but is not yet full or empty."),
           p(class = "note", "No machine learning, GPS optimization, causal attribution, or real-world predictive claims are made."))
     )
@@ -175,7 +194,8 @@ server <- function(input, output, session) {
     df$move_bikes <- round(df$capacity / 2) - df$bikes
     df$priority <- ifelse(df$status %in% c("EMPTY", "FULL"), 1,
                    ifelse(df$status == "WATCH", 2, 3))
-    df[order(df$priority, -abs(df$move_bikes), df$station_id), , drop = FALSE]
+    df[order(df$priority, -df$unusable_run_hours,
+             -abs(df$move_bikes), df$station_id), , drop = FALSE]
   })
 
   output$kpi_stations <- renderText(N_STATIONS)
@@ -214,11 +234,26 @@ server <- function(input, output, session) {
     df <- df[df$status != "OK", , drop = FALSE]
     if (nrow(df) == 0) return(data.frame(Message = "No dispatch alerts at this snapshot"))
     result <- df[, c("station_id", "neighborhood", "bikes", "docks",
-                     "capacity", "status", "action", "move_bikes"), drop = FALSE]
+                     "capacity", "status", "unusable_run_hours", "action", "move_bikes"),
+                 drop = FALSE]
     names(result) <- c("Station", "Area", "Bikes", "Open docks", "Capacity",
-                       "Status", "Suggested action", "Bike movement (+ deliver)")
+                       "Status", "Current outage (h)", "Suggested action",
+                       "Bike movement (+ deliver)")
     result
   }, striped = TRUE, bordered = FALSE, spacing = "s", rownames = FALSE)
+
+  output$area_availability <- renderTable({
+    df <- selected_day()
+    by_area <- aggregate(usable ~ neighborhood, data = df, FUN = mean)
+    bad <- aggregate(unusable ~ neighborhood, data = df, FUN = sum)
+    output_table <- data.frame(
+      Area = by_area$neighborhood,
+      `Availability (%)` = sprintf("%.1f", 100 * by_area$usable),
+      `Unusable station-hours` = sprintf("%.2f", bad$unusable * INTERVAL_HOURS),
+      check.names = FALSE
+    )
+    output_table[order(as.numeric(output_table[["Availability (%)"]])), , drop = FALSE]
+  }, striped = TRUE, spacing = "s", rownames = FALSE)
 
   output$pchart <- renderPlot({
     values <- hourly_counts$p
